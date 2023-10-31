@@ -96,10 +96,41 @@ if ddp:
     assert gradient_accumulation_steps % ddp_world_size == 0
     gradient_accumulation_steps //= ddp_world_size
 else:
-    # if not ddp, we are running on a single gpu, and one process
-    master_process = True
-    seed_offset = 0
-    ddp_world_size = 1
+    ddp = int(os.environ.get('SLURM_PROCID', -1)) != -1 # is this a ddp run?
+    if ddp:
+        os.environ['MASTER_ADDR'] = f"{get_master_node()}"  #tcp://
+        os.environ['MASTER_PORT'] = "12349"
+        os.environ['RANK'] = os.environ['SLURM_PROCID']
+        os.environ['LOCAL_RANK'] = str(int(os.environ['SLURM_PROCID']) % 8)
+        os.environ['WORLD_SIZE'] = os.environ['SLURM_NPROCS']
+        # init_process_group(backend=backend)
+        import torch.distributed as dist
+        dist.init_process_group(
+            rank=int(os.environ['RANK']),
+            world_size=int(os.environ['WORLD_SIZE']),
+            backend=backend,
+            init_method=f"tcp://{os.environ['MASTER_ADDR']}:{os.environ['MASTER_PORT']}",
+            )
+
+        ddp_rank = int(os.environ['RANK'])
+        ddp_local_rank = int(os.environ['LOCAL_RANK'])
+        ddp_world_size = int(os.environ['WORLD_SIZE'])
+        device = f'cuda:{ddp_local_rank}'
+        torch.cuda.set_device(device)
+
+        dist.barrier()
+        print(f"ddp_world_size: {ddp_world_size}, gradient_accumulation_steps: {gradient_accumulation_steps}", flush=True)
+        master_process = ddp_rank == 0 # this process will do logging, checkpointing etc.
+        seed_offset = ddp_rank # each process gets a different seed
+        # world_size number of processes will be training simultaneously, so we can scale
+        # down the desired gradient accumulation iterations per process proportionally
+        assert gradient_accumulation_steps % ddp_world_size == 0
+        gradient_accumulation_steps //= ddp_world_size
+    else:
+        # if not ddp, we are running on a single gpu, and one process
+        master_process = True
+        seed_offset = 0
+        ddp_world_size = 1
 tokens_per_iter = gradient_accumulation_steps * ddp_world_size * batch_size * block_size
 print(f"tokens per iteration will be: {tokens_per_iter:,}")
 
