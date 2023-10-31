@@ -20,6 +20,7 @@ import os
 import time
 import math
 import pickle
+import random
 from contextlib import nullcontext
 
 import numpy as np
@@ -44,9 +45,9 @@ wandb_log = False # disabled by default
 wandb_project = 'owt'
 wandb_run_name = 'gpt2' # 'run' + str(time.time())
 # data
-dataset = 'openwebtext'
-gradient_accumulation_steps = 5 * 8 # used to simulate larger batch sizes
-batch_size = 12 # if gradient_accumulation_steps > 1, this is the micro-batch size
+dataset = 'shakespeare_char'
+gradient_accumulation_steps = 4 * 8 # used to simulate larger batch sizes
+batch_size = 16 # if gradient_accumulation_steps > 1, this is the micro-batch size
 block_size = 1024
 # model
 n_layer = 12
@@ -71,7 +72,7 @@ backend = 'nccl' # 'nccl', 'gloo', etc.
 # system
 device = 'cuda' # examples: 'cpu', 'cuda', 'cuda:0', 'cuda:1' etc., or try 'mps' on macbooks
 dtype = 'bfloat16' if torch.cuda.is_available() and torch.cuda.is_bf16_supported() else 'float16' # 'float32', 'bfloat16', or 'float16', the latter will auto implement a GradScaler
-compile = True # use PyTorch 2.0 to compile the model to be faster
+compile = False # use PyTorch 2.0 to compile the model to be faster
 # -----------------------------------------------------------------------------
 config_keys = [k for k,v in globals().items() if not k.startswith('_') and isinstance(v, (int, float, bool, str))]
 exec(open('configurator.py').read()) # overrides from command line or config file
@@ -85,6 +86,7 @@ if ddp:
     ddp_rank = int(os.environ['RANK'])
     ddp_local_rank = int(os.environ['LOCAL_RANK'])
     ddp_world_size = int(os.environ['WORLD_SIZE'])
+    print(f"ddp_world_size: {ddp_world_size}, gradient_accumulation_steps: {gradient_accumulation_steps}", flush=True)
     device = f'cuda:{ddp_local_rank}'
     torch.cuda.set_device(device)
     master_process = ddp_rank == 0 # this process will do logging, checkpointing etc.
@@ -103,9 +105,27 @@ print(f"tokens per iteration will be: {tokens_per_iter:,}")
 
 if master_process:
     os.makedirs(out_dir, exist_ok=True)
-torch.manual_seed(1337 + seed_offset)
+
+# set seed
+seed = 1024
+cuda_deterministic = True
+seed_offset = 0 # 我们强制让所有的东西都一样
+torch.manual_seed(seed + seed_offset)
 torch.backends.cuda.matmul.allow_tf32 = True # allow tf32 on matmul
 torch.backends.cudnn.allow_tf32 = True # allow tf32 on cudnn
+random.seed(seed)
+np.random.seed(seed)
+torch.manual_seed(seed)
+if torch.cuda.is_available():
+    torch.cuda.manual_seed(seed)
+    torch.cuda.manual_seed_all(seed)
+if cuda_deterministic:  # slower, more reproducible
+    torch.backends.cudnn.deterministic = True
+    torch.backends.cudnn.benchmark = False
+else:
+    torch.backends.cudnn.deterministic = False
+    torch.backends.cudnn.benchmark = True
+
 device_type = 'cuda' if 'cuda' in device else 'cpu' # for later use in torch.autocast
 # note: float16 data type will automatically use a GradScaler
 ptdtype = {'float32': torch.float32, 'bfloat16': torch.bfloat16, 'float16': torch.float16}[dtype]
@@ -280,7 +300,11 @@ while True:
                     'config': config,
                 }
                 print(f"saving checkpoint to {out_dir}")
-                torch.save(checkpoint, os.path.join(out_dir, 'ckpt.pt'))
+                try:
+                    torch.save(checkpoint, os.path.join(out_dir, os.environ['JOB_NAME_TEMP'] + '_ckpt.pt'))
+                except KeyError:
+                    torch.save(checkpoint, os.path.join(out_dir, 'ckpt.pt'))
+
     if iter_num == 0 and eval_only:
         break
 
