@@ -21,7 +21,7 @@ LAUNCH_TIME=$(date +'%m-%d-%H:%M:%S')
 log_file=${LOG_NAME}_${LAUNCH_TIME}.log
 export JOB_NAME_TEMP=${LOG_NAME}-${LAUNCH_TIME}
 export JOB_NAME_TEMP=${JOB_NAME_TEMP} && \
- srun -p llm_s --time=12:00  -n${WORLD_SIZE} -N${NODE_COUNT} --ntasks-per-node=${GPUS_PER_NODE} --gpus-per-task=1 \
-  python train.py  config/train_shakespeare_char.py > ./${FOLDER_NAME}/${log_file} 2>&1 & 
+ srun -p llm_s --quotatype=spot  --time=12:00  -n${WORLD_SIZE} -N${NODE_COUNT} --ntasks-per-node=${GPUS_PER_NODE} --gpus-per-task=1 \
+  python train.py  config/train_shakespeare_char.py
 
-# --quotatype=spot
+#  > ./${FOLDER_NAME}/${log_file} 2>&1 & 

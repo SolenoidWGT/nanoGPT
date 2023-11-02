@@ -27,8 +27,18 @@ import numpy as np
 import torch
 from torch.nn.parallel import DistributedDataParallel as DDP
 from torch.distributed import init_process_group, destroy_process_group
-
+import torch.distributed as dist
 from model import GPTConfig, GPT
+
+
+# old_allreduce = dist.all_reduce 
+
+# def my_allreduce(*args, **kwargs):
+#     print("my_allreduce", flush=True)
+#     return old_allreduce(*args, **kwargs)
+
+# dist.all_reduce = my_allreduce
+
 
 # -----------------------------------------------------------------------------
 # default config values designed to train a gpt2 (124M) on OpenWebText
@@ -49,7 +59,8 @@ dataset = 'shakespeare_char'
 gradient_accumulation_steps = 4 * 8 # used to simulate larger batch sizes
 batch_size = 16 # if gradient_accumulation_steps > 1, this is the micro-batch size
 
-USE_DDP=True
+USE_DDP=False
+USE_MY_DDP=True
 ddp=USE_DDP
 IS_SLURM = int(os.environ.get('SLURM_PROCID', -1)) != -1
 # gradient_accumulation_steps = 1 # used to simulate larger batch sizes
@@ -115,7 +126,7 @@ else:
     torch.backends.cudnn.benchmark = True
 
 # various inits, derived attributes, I/O setup
-if USE_DDP:
+if USE_DDP or USE_MY_DDP:
     if IS_SLURM:
         os.environ['MASTER_ADDR'] = f"{get_master_node()}"  #tcp://
         os.environ['MASTER_PORT'] = "12349"
@@ -363,6 +374,12 @@ while True:
         X, Y = get_batch('train')
         # backward pass, with gradient scaling if training in fp16
         scaler.scale(loss).backward()
+    
+    if USE_MY_DDP:
+        for module_name, module in model.named_modules():
+            for param_name, param in module.named_parameters(recurse=False):
+                dist.all_reduce(param.grad, torch.distributed.ReduceOp.AVG)
+
     # clip the gradient
     if grad_clip != 0.0:
         scaler.unscale_(optimizer)
