@@ -48,6 +48,12 @@ wandb_run_name = 'gpt2' # 'run' + str(time.time())
 dataset = 'shakespeare_char'
 gradient_accumulation_steps = 4 * 8 # used to simulate larger batch sizes
 batch_size = 16 # if gradient_accumulation_steps > 1, this is the micro-batch size
+
+USE_DDP=True
+ddp=USE_DDP
+IS_SLURM = int(os.environ.get('SLURM_PROCID', -1)) != -1
+# gradient_accumulation_steps = 1 # used to simulate larger batch sizes
+# batch_size = 1 # if gradient_accumulation_steps > 1, this is the micro-batch size
 block_size = 1024
 # model
 n_layer = 12
@@ -71,7 +77,7 @@ min_lr = 6e-5 # minimum learning rate, should be ~= learning_rate/10 per Chinchi
 backend = 'nccl' # 'nccl', 'gloo', etc.
 # system
 device = 'cuda' # examples: 'cpu', 'cuda', 'cuda:0', 'cuda:1' etc., or try 'mps' on macbooks
-dtype = 'bfloat16' if torch.cuda.is_available() and torch.cuda.is_bf16_supported() else 'float16' # 'float32', 'bfloat16', or 'float16', the latter will auto implement a GradScaler
+dtype = 'float16' if torch.cuda.is_available() and torch.cuda.is_bf16_supported() else 'float16' # 'float32', 'bfloat16', or 'float16', the latter will auto implement a GradScaler
 compile = False # use PyTorch 2.0 to compile the model to be faster
 # -----------------------------------------------------------------------------
 config_keys = [k for k,v in globals().items() if not k.startswith('_') and isinstance(v, (int, float, bool, str))]
@@ -87,64 +93,6 @@ def get_master_node():
     result = subprocess.check_output('scontrol show hostnames "$SLURM_JOB_NODELIST" | head -n 1', shell=True)
     result = result.decode("utf8").strip()
     return result
-
-# various inits, derived attributes, I/O setup
-ddp = int(os.environ.get('RANK', -1)) != -1 # is this a ddp run?
-if ddp:
-    init_process_group(backend=backend)
-    ddp_rank = int(os.environ['RANK'])
-    ddp_local_rank = int(os.environ['LOCAL_RANK'])
-    ddp_world_size = int(os.environ['WORLD_SIZE'])
-    print(f"ddp_world_size: {ddp_world_size}, gradient_accumulation_steps: {gradient_accumulation_steps}", flush=True)
-    device = f'cuda:{ddp_local_rank}'
-    torch.cuda.set_device(device)
-    master_process = ddp_rank == 0 # this process will do logging, checkpointing etc.
-    seed_offset = ddp_rank # each process gets a different seed
-    # world_size number of processes will be training simultaneously, so we can scale
-    # down the desired gradient accumulation iterations per process proportionally
-    assert gradient_accumulation_steps % ddp_world_size == 0
-    gradient_accumulation_steps //= ddp_world_size
-else:
-    ddp = int(os.environ.get('SLURM_PROCID', -1)) != -1 # is this a ddp run?
-    if ddp:
-        os.environ['MASTER_ADDR'] = f"{get_master_node()}"  #tcp://
-        os.environ['MASTER_PORT'] = "12349"
-        os.environ['RANK'] = os.environ['SLURM_PROCID']
-        os.environ['LOCAL_RANK'] = str(int(os.environ['SLURM_PROCID']) % 8)
-        os.environ['WORLD_SIZE'] = os.environ['SLURM_NPROCS']
-        # init_process_group(backend=backend)
-        import torch.distributed as dist
-        dist.init_process_group(
-            rank=int(os.environ['RANK']),
-            world_size=int(os.environ['WORLD_SIZE']),
-            backend=backend,
-            init_method=f"tcp://{os.environ['MASTER_ADDR']}:{os.environ['MASTER_PORT']}",
-            )
-
-        ddp_rank = int(os.environ['RANK'])
-        ddp_local_rank = int(os.environ['LOCAL_RANK'])
-        ddp_world_size = int(os.environ['WORLD_SIZE'])
-        device = f'cuda:{ddp_local_rank}'
-        torch.cuda.set_device(device)
-
-        dist.barrier()
-        print(f"ddp_world_size: {ddp_world_size}, gradient_accumulation_steps: {gradient_accumulation_steps}", flush=True)
-        master_process = ddp_rank == 0 # this process will do logging, checkpointing etc.
-        seed_offset = ddp_rank # each process gets a different seed
-        # world_size number of processes will be training simultaneously, so we can scale
-        # down the desired gradient accumulation iterations per process proportionally
-        assert gradient_accumulation_steps % ddp_world_size == 0
-        gradient_accumulation_steps //= ddp_world_size
-    else:
-        # if not ddp, we are running on a single gpu, and one process
-        master_process = True
-        seed_offset = 0
-        ddp_world_size = 1
-tokens_per_iter = gradient_accumulation_steps * ddp_world_size * batch_size * block_size
-print(f"tokens per iteration will be: {tokens_per_iter:,}")
-
-if master_process:
-    os.makedirs(out_dir, exist_ok=True)
 
 # set seed
 seed = 1024
@@ -165,6 +113,57 @@ if cuda_deterministic:  # slower, more reproducible
 else:
     torch.backends.cudnn.deterministic = False
     torch.backends.cudnn.benchmark = True
+
+# various inits, derived attributes, I/O setup
+if USE_DDP:
+    if IS_SLURM:
+        os.environ['MASTER_ADDR'] = f"{get_master_node()}"  #tcp://
+        os.environ['MASTER_PORT'] = "12349"
+        os.environ['RANK'] = os.environ['SLURM_PROCID']
+        os.environ['LOCAL_RANK'] = str(int(os.environ['SLURM_PROCID']) % 8)
+        os.environ['WORLD_SIZE'] = os.environ['SLURM_NPROCS']
+        # init_process_group(backend=backend)
+        import torch.distributed as dist
+        dist.init_process_group(
+            rank=int(os.environ['RANK']),
+            world_size=int(os.environ['WORLD_SIZE']),
+            backend=backend,
+            init_method=f"tcp://{os.environ['MASTER_ADDR']}:{os.environ['MASTER_PORT']}",
+            )
+
+        ddp_rank = int(os.environ['RANK'])
+        ddp_local_rank = int(os.environ['LOCAL_RANK'])
+        ddp_world_size = int(os.environ['WORLD_SIZE'])
+        if device != "cpu":
+            device = f'cuda:{ddp_local_rank}'
+            torch.cuda.set_device(device)
+    else:
+        init_process_group(backend=backend)
+        ddp_rank = int(os.environ['RANK'])
+        ddp_local_rank = int(os.environ['LOCAL_RANK'])
+        ddp_world_size = int(os.environ['WORLD_SIZE'])
+        print(f"ddp_world_size: {ddp_world_size}, gradient_accumulation_steps: {gradient_accumulation_steps}", flush=True)
+        if device != "cpu":
+            device = f'cuda:{ddp_local_rank}'
+            torch.cuda.set_device(device)
+
+    master_process = ddp_rank == 0 # this process will do logging, checkpointing etc.
+    seed_offset = ddp_rank # each process gets a different seed
+    # world_size number of processes will be training simultaneously, so we can scale
+    # down the desired gradient accumulation iterations per process proportionally
+    assert gradient_accumulation_steps % ddp_world_size == 0
+    gradient_accumulation_steps //= ddp_world_size
+else:
+    # if not ddp, we are running on a single gpu, and one process
+    master_process = True
+    seed_offset = 0
+    ddp_world_size = 1
+
+tokens_per_iter = gradient_accumulation_steps * ddp_world_size * batch_size * block_size
+print(f"tokens per iteration will be: {tokens_per_iter:,}", flush=True)
+
+if master_process:
+    os.makedirs(out_dir, exist_ok=True)
 
 device_type = 'cuda' if 'cuda' in device else 'cpu' # for later use in torch.autocast
 # note: float16 data type will automatically use a GradScaler
@@ -385,7 +384,7 @@ while True:
         if local_iter_num >= 5: # let the training loop settle a bit
             mfu = raw_model.estimate_mfu(batch_size * gradient_accumulation_steps, dt)
             running_mfu = mfu if running_mfu == -1.0 else 0.9*running_mfu + 0.1*mfu
-        print(f"iter {iter_num}: loss {lossf:.4f}, time {dt*1000:.2f}ms, mfu {running_mfu*100:.2f}%")
+        print(f"iter {iter_num}: loss {lossf:.4f}, time {dt*1000:.2f}ms, mfu {running_mfu*100:.2f}%", flush=True)
     iter_num += 1
     local_iter_num += 1
 
