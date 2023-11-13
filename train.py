@@ -16,20 +16,20 @@ $ torchrun --nproc_per_node=8 --nnodes=2 --node_rank=1 --master_addr=123.456.123
 (If your cluster does not have Infiniband interconnect prepend NCCL_IB_DISABLE=1)
 """
 
-import os
-import time
 import math
+import os
 import pickle
 import random
+import time
 from contextlib import nullcontext
 
 import numpy as np
 import torch
-from torch.nn.parallel import DistributedDataParallel as DDP
-from torch.distributed import init_process_group, destroy_process_group
 import torch.distributed as dist
-from model import GPTConfig, GPT
+from torch.distributed import destroy_process_group, init_process_group
+from torch.nn.parallel import DistributedDataParallel as DDP
 
+from model import GPT, GPTConfig
 
 # old_allreduce = dist.all_reduce 
 
@@ -43,7 +43,7 @@ from model import GPTConfig, GPT
 # -----------------------------------------------------------------------------
 # default config values designed to train a gpt2 (124M) on OpenWebText
 # I/O
-out_dir = 'out'
+out_dir = 'save_ckpt'
 eval_interval = 2000
 log_interval = 1
 eval_iters = 200
@@ -74,7 +74,7 @@ dropout = 0.0 # for pretraining 0 is good, for finetuning try 0.1+
 bias = False # do we use bias inside LayerNorm and Linear layers?
 # adamw optimizer
 learning_rate = 6e-4 # max learning rate
-max_iters = 600000 # total number of training iterations
+max_iters = 250 # total number of training iterations
 weight_decay = 1e-1
 beta1 = 0.9
 beta2 = 0.95
@@ -88,7 +88,12 @@ min_lr = 6e-5 # minimum learning rate, should be ~= learning_rate/10 per Chinchi
 backend = 'nccl' # 'nccl', 'gloo', etc.
 # system
 device = 'cuda' # examples: 'cpu', 'cuda', 'cuda:0', 'cuda:1' etc., or try 'mps' on macbooks
-dtype = 'float16' if torch.cuda.is_available() and torch.cuda.is_bf16_supported() else 'float16' # 'float32', 'bfloat16', or 'float16', the latter will auto implement a GradScaler
+if os.environ['DATA_TYPE'] == 'bfloat16':
+    dtype = 'float16' 
+elif os.environ['DATA_TYPE'] == 'float32':
+    dtype = 'float32'
+
+DUMP_DATA = 'DUMP_DATA' in os.environ
 compile = False # use PyTorch 2.0 to compile the model to be faster
 # -----------------------------------------------------------------------------
 config_keys = [k for k,v in globals().items() if not k.startswith('_') and isinstance(v, (int, float, bool, str))]
@@ -131,8 +136,11 @@ if USE_DDP or USE_MY_DDP:
         os.environ['MASTER_ADDR'] = f"{get_master_node()}"  #tcp://
         os.environ['MASTER_PORT'] = "12349"
         os.environ['RANK'] = os.environ['SLURM_PROCID']
-        os.environ['LOCAL_RANK'] = str(int(os.environ['SLURM_PROCID']) % 8)
+        os.environ['LOCAL_RANK'] = str(int(os.environ['SLURM_PROCID']) % int(os.environ['SLURM_NPROCS']))
         os.environ['WORLD_SIZE'] = os.environ['SLURM_NPROCS']
+        if int(os.environ['RANK'] ) == 0:
+            os.environ['NCCL_DEBUG'] = "INFO"
+
         # init_process_group(backend=backend)
         import torch.distributed as dist
         dist.init_process_group(
@@ -140,14 +148,19 @@ if USE_DDP or USE_MY_DDP:
             world_size=int(os.environ['WORLD_SIZE']),
             backend=backend,
             init_method=f"tcp://{os.environ['MASTER_ADDR']}:{os.environ['MASTER_PORT']}",
-            )
+        )
 
         ddp_rank = int(os.environ['RANK'])
         ddp_local_rank = int(os.environ['LOCAL_RANK'])
         ddp_world_size = int(os.environ['WORLD_SIZE'])
         if device != "cpu":
-            device = f'cuda:{ddp_local_rank}'
-            torch.cuda.set_device(device)
+            if os.environ['USE_IB'] == '1':
+                device = "cuda:0"
+                print(f"Rank:{dist.get_rank()}, dev: {device}, CUDA_VISIBLE_DEVICES:{os.environ['CUDA_VISIBLE_DEVICES']}, device_count:{torch.cuda.device_count()}", flush=True)
+            else:
+                device = f"cuda:{os.environ['LOCAL_RANK']}"
+                print(f"Rank:{dist.get_rank()}, dev: {device}, CUDA_VISIBLE_DEVICES:{os.environ['CUDA_VISIBLE_DEVICES']}, device_count:{torch.cuda.device_count()}", flush=True)
+        torch.cuda.set_device(device)
     else:
         init_process_group(backend=backend)
         ddp_rank = int(os.environ['RANK'])
@@ -213,6 +226,8 @@ if os.path.exists(meta_path):
 # model init
 model_args = dict(n_layer=n_layer, n_head=n_head, n_embd=n_embd, block_size=block_size,
                   bias=bias, vocab_size=None, dropout=dropout) # start with model_args from command line
+
+init_from="resume"
 if init_from == 'scratch':
     # init a new model from scratch
     print("Initializing a new model from scratch")
@@ -225,8 +240,7 @@ if init_from == 'scratch':
 elif init_from == 'resume':
     print(f"Resuming training from {out_dir}")
     # resume training from a checkpoint.
-    ckpt_path = os.path.join(out_dir, 'ckpt.pt')
-    checkpoint = torch.load(ckpt_path, map_location=device)
+    checkpoint = torch.load("./save_ckpt/init_ckpt_rank_0.pt", map_location=device)
     checkpoint_model_args = checkpoint['model_args']
     # force these config attributes to be equal otherwise we can't even resume training
     # the rest of the attributes (e.g. dropout) can stay as desired from command line
@@ -277,6 +291,7 @@ if compile:
 # wrap model into DDP container
 if ddp:
     model = DDP(model, device_ids=[ddp_local_rank])
+    assert False
 
 # helps estimate an arbitrarily accurate loss over either split using many batches
 @torch.no_grad()
@@ -319,7 +334,16 @@ t0 = time.time()
 local_iter_num = 0 # number of iterations in the lifetime of this process
 raw_model = model.module if ddp else model # unwrap DDP container if needed
 running_mfu = -1.0
+
+# os.path.exists() method
+if not os.path.exists(out_dir):
+    os.makedirs(out_dir, exist_ok="True")
+
+max_iters = 250
 while True:
+    if DUMP_DATA:
+        torch.cuda.synchronize()
+        torch.save(raw_model.state_dict(), os.path.join(out_dir, f'param_{iter_num}_rank_{dist.get_rank()}.pt'))
 
     # determine and set the learning rate for this iteration
     lr = get_lr(iter_num) if decay_lr else learning_rate
@@ -349,11 +373,8 @@ while True:
                     'best_val_loss': best_val_loss,
                     'config': config,
                 }
-                print(f"saving checkpoint to {out_dir}")
-                try:
-                    torch.save(checkpoint, os.path.join(out_dir, os.environ['JOB_NAME_TEMP'] + '_ckpt.pt'))
-                except KeyError:
-                    torch.save(checkpoint, os.path.join(out_dir, 'ckpt.pt'))
+                # print(f"saving checkpoint to {out_dir}")
+                # torch.save(checkpoint, os.path.join("./save_ckpt", 'ckpt.pt'))
 
     if iter_num == 0 and eval_only:
         break
@@ -374,11 +395,29 @@ while True:
         X, Y = get_batch('train')
         # backward pass, with gradient scaling if training in fp16
         scaler.scale(loss).backward()
-    
+
+    if DUMP_DATA:
+        torch.cuda.synchronize()
+        grads_states = {}
+        for module_name, module in model.named_modules():
+            for param_name, param in module.named_parameters(recurse=False):
+                grads_states[f'{module_name}.{param_name}'] = param.grad
+
+        torch.save(grads_states,os.path.join(out_dir, f'step_{iter_num}_grad_rank_{dist.get_rank()}_pre.pt'))
+
     if USE_MY_DDP:
         for module_name, module in model.named_modules():
             for param_name, param in module.named_parameters(recurse=False):
                 dist.all_reduce(param.grad, torch.distributed.ReduceOp.AVG)
+
+    if DUMP_DATA:
+        torch.cuda.synchronize()
+        grads_states = {}
+        for module_name, module in model.named_modules():
+            for param_name, param in module.named_parameters(recurse=False):
+                grads_states[f'{module_name}.{param_name}'] = param.grad
+
+        torch.save(grads_states,os.path.join(out_dir, f'step_{iter_num}_grad_rank_{dist.get_rank()}_after.pt'))
 
     # clip the gradient
     if grad_clip != 0.0:
